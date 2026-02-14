@@ -6,7 +6,7 @@ from google.genai import types
 st.set_page_config(page_title="Coach Syed | Boardroom Sandbox", page_icon=" 💡 ", layout="centered")
 
 st.title("💡 Welcome to Coach Syed")
-st.markdown("**Your 24/7 Strategic Sounding Board.** Let's think about your ideas together.")
+st.markdown("**Your 24/7 Strategic Sounding Board.** Helping you move ahead, one question at a time.")
 
 # Liability Warning
 st.info("""
