@@ -124,14 +124,14 @@ def get_optimal_model(user_prompt):
     """
     try:
         # We use Flash to quickly grade the prompt (takes ~0.5 seconds and costs practically nothing)
-        router = genai.GenerativeModel("gemini-2.5-flash-latest", system_instruction=router_instruction)
+        router = genai.GenerativeModel("gemini-2.0-flash-latest", system_instruction=router_instruction)
         decision = router.generate_content(user_prompt).text.strip().upper()
         if "PRO" in decision:
-            return "gemini-2.5-pro-latest"
+            return "gemini-2.0-pro-latest"
         else:
-            return "gemini-2.5-flash-latest"
+            return "gemini-2.0-flash-latest"
     except:
-        return "gemini-2.5-pro-latest" # Default to the smarter model if routing fails
+        return "gemini-2.0-pro-latest" # Default to the smarter model if routing fails
 
 # --- 5. CHAT HISTORY LOGIC ---
 if "messages" not in st.session_state:
