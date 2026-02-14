@@ -1,12 +1,14 @@
 import streamlit as st
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 # --- 1. CONFIGURATION & UI WARNING ---
-st.set_page_config(page_title="Coach Syed | Boardroom Sandbox", page_icon="💡", layout="centered")
-st.title("💡 Welcome to Coach Syed")
-st.markdown("**Your 24/7 Sounding Board.** Let's think about your ideas together.")
+st.set_page_config(page_title="Coach Syed | Boardroom Sandbox", page_icon=" 💡 ", layout="centered")
 
-# Liability Warning Displayed on UI
+st.title("💡 Welcome to Coach Syed")
+st.markdown("**Your 24/7 Strategic Sounding Board.** Let's think about your ideas together.")
+
+# Liability Warning
 st.info("""
 **BETA TESTING NOTICE & LIABILITY WAIVER:** This tool is currently being tested and is for **educational purposes only**.
 Do not seek legal, financial, or health guidance from this tool.
@@ -14,9 +16,9 @@ Do not use this tool to make any actual life or business decisions. Please seek 
 **All liability rests with the user.** Please double-check all answers and use your own critical judgment.
 """)
 
-# --- 2. SETUP GEMINI API ---
+# --- 2. SETUP NEW GOOGLE GENAI CLIENT ---
 if "GOOGLE_API_KEY" in st.secrets:
-    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    client = genai.Client(api_key=st.secrets["GOOGLE_API_KEY"])
 else:
     st.error("System Error: Missing API Key. Please contact Professor Syed.")
 
@@ -86,7 +88,7 @@ Coaching style:
 - Consider second-level and third-level implications of your response before responding.
 
 Under all circumstances and always you have to enforce the following safety policy:
-Refuse or redirect requests involving:
+Refuse requests involving:
 - Violence, self-harm, or instructions to hurt people
 - Illegal activities or evading law enforcement
 - Weapon construction or operational wrongdoing
@@ -95,7 +97,7 @@ Refuse or redirect requests involving:
 - Medical/legal/financial/mental-health diagnosis or step-by-step prescriptive advice
 - Academic dishonesty: requests to produce final submissions, impersonate authorship, or plagiarize
 
-When refusing:
+When refusing above requests:
 1) Be brief and respectful
 2) State you can’t help with that request
 
@@ -114,7 +116,7 @@ Under all circumstances and always you have to strictly comply with the followin
 - Do NOT mention retrieval or that documents were consulted.
 """
 
-# --- 4. THE AUTO-ROUTER LOGIC ---
+# --- 4. THE AUTO-ROUTER LOGIC (NEW SDK) ---
 def get_optimal_model(user_prompt):
     """Silently determines if the prompt needs Flash (simple) or Pro (complex)."""
     router_instruction = """
@@ -123,15 +125,20 @@ def get_optimal_model(user_prompt):
     If it is a complex business scenario, requires applying frameworks, or asks for strategic analysis, reply ONLY with the word: PRO.
     """
     try:
-        # We use Flash to quickly grade the prompt (takes ~0.5 seconds and costs practically nothing)
-        router = genai.GenerativeModel("gemini-2.0-flash-latest", system_instruction=router_instruction)
-        decision = router.generate_content(user_prompt).text.strip().upper()
+        # Using gemini-2.5-flash for the quick check
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=user_prompt,
+            config=types.GenerateContentConfig(system_instruction=router_instruction)
+        )
+        decision = response.text.strip().upper()
+        
         if "PRO" in decision:
-            return "gemini-2.0-pro-latest"
+            return "gemini-2.5-pro"
         else:
-            return "gemini-2.0-flash-latest"
+            return "gemini-2.5-flash"
     except:
-        return "gemini-2.0-pro-latest" # Default to the smarter model if routing fails
+        return "gemini-2.5-pro" # Default to the smart model if routing fails
 
 # --- 5. CHAT HISTORY LOGIC ---
 if "messages" not in st.session_state:
@@ -141,7 +148,7 @@ for message in st.session_state.messages:
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
 
-# --- 6. THE CHAT LOOP ---
+# --- 6. THE CHAT LOOP (NEW SDK) ---
 if prompt := st.chat_input("Coach Syed is listening. How can I help you?"):
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -149,10 +156,13 @@ if prompt := st.chat_input("Coach Syed is listening. How can I help you?"):
         # 1. Determine the best model for this specific question
         best_model_name = get_optimal_model(prompt)
 
-        # 2. Generate the response with the chosen model and Coach Syed persona
-        model = genai.GenerativeModel(best_model_name, system_instruction=system_instruction)
-        response = model.generate_content(prompt)
-
+        # 2. Generate the response with the chosen model (2.5) and new SDK syntax
+        response = client.models.generate_content(
+            model=best_model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(system_instruction=system_instruction)
+        )
+        
         # 3. Display response
         with st.chat_message("assistant"):
             st.markdown(response.text)
