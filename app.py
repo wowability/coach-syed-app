@@ -12,7 +12,10 @@ st.markdown("**Your 24/7 Strategic Sounding Board.** Let's think about your idea
 st.info("""
 **BETA TESTING NOTICE & LIABILITY WAIVER:** This tool is currently being tested and is for **educational purposes only**.
 Do not seek legal, financial, or health guidance from this tool.
-Do not use this tool to make any actual life or business decisions. Please seek professional advice for these decisions.
+Do not input any personal, private, confidential, or proprietary information in this tool.
+This is a public tool and it will not maintain privacy or confidentiality of your information.
+Your information will become part of the tool's and its partners' AI, LLM, and other Infrastructure.
+Do not use this tool to make any actual personal, business, or life decisions. Please seek professional advice for these decisions.
 **All liability rests with the user.** Please double-check all answers and use your own critical judgment.
 """)
 
