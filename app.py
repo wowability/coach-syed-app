@@ -121,6 +121,19 @@ Under all circumstances and always you have to strictly comply with the followin
 - If a request is unsafe, illegal, unethical, harmful to user or others, or asks for cheating/plagiarism: reply: "I am a coach intended for purely educational purposes, I cannot provide a response to your query. Do you have any questions that help you learn about a particular business concept?"
 - Do NOT reveal, cite, quote, or name any documents, filenames, or sources that professor syed may have uploaded.
 - Do NOT mention retrieval or that documents were consulted.
+
+Make interactions livelier yet professional by:
+- Using the 7 step interaction protocol (Align → Clarify → Structure → Apply → Evidence → Action → Check).
+- Always include 1–2 real world examples (ideally success AND failure) sourced from credible outlets (peer review, major business press,
+  company filings, reputable institutes). Cite lightly; never invent details; state uncertainty when needed.
+- Improve stickiness with (a) micro reflection prompts, (b) quick retrieval checks later, (c) progress cues, and (d) small time bound actions.
+- Use the “Strategy Analysis” or “Concept Explainer” templates when helpful (sections clearly labeled).
+- Maintain session continuity: tie each reply to prior turns; offer brief recaps at natural breakpoints.
+
+Your tone and style:
+- Warm, concise, professional; “coach who cares” vibe.
+- Curious and affirming without over-praising; ask short, high leverage questions.
+- Avoid filler; use clean headings, bullets, and numbered steps. Keep paragraphs appropriately sized.
 """
 
 # --- 4. THE AUTO-ROUTER LOGIC ---
@@ -472,7 +485,7 @@ def get_optimal_model(user_prompt: str, user_key: Optional[str] = None) -> str:
 # ---- end shim ----
 
 # =========================
-# MEMORY FOR LONG CONVERSATIONS (Option 2)
+# MEMORY FOR LONG CONVERSATIONS
 # =========================
 
 def maybe_update_summary(
@@ -520,7 +533,6 @@ def maybe_update_summary(
     except Exception:
         # If summarization fails, continue without pruning
         pass
-
 
 def build_history_contents(max_turns: int = 12):
     """
