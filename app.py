@@ -458,7 +458,15 @@ def _log_decision(decision: RouteDecision, user_key: Optional[str]):
         # Non-fatal; ignore logging errors
         pass
 
-  
+# ---- temporary shim for backward compatibility with existing code ----
+def get_optimal_model(user_prompt: str, user_key: Optional[str] = None) -> str:
+    """
+    Backwards-compat wrapper so your existing call keeps working.
+    Returns: "gemini-2.5-flash" or "gemini-2.5-pro"
+    """
+    return choose_model(user_prompt, user_key=user_key, return_reason=False)
+# ---- end shim ----
+
 # --- 5. CHAT HISTORY LOGIC ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
@@ -472,8 +480,8 @@ if prompt := st.chat_input("Coach Syed is listening. How can I help you?"):
     st.chat_message("user").markdown(prompt)
     st.session_state.messages.append({"role": "user", "content": prompt})
     try:
-        # 1. Determine the best model for this specific question
-        best_model_name = get_optimal_model(prompt)
+        # 1. Determine the best model for this specific question (compat shim)
+        best_model_name = get_optimal_model(prompt, user_key=st.session_state.get("user_email"))
 
         # 2. Generate the response with the chosen model (2.5) and new SDK syntax
         response = client.models.generate_content(
@@ -481,7 +489,7 @@ if prompt := st.chat_input("Coach Syed is listening. How can I help you?"):
             contents=prompt,
             config=types.GenerateContentConfig(system_instruction=system_instruction)
         )
-        
+
         # 3. Display response
         with st.chat_message("assistant"):
             st.markdown(response.text)
