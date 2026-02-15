@@ -496,7 +496,7 @@ def maybe_update_summary(
     for m in window:
         role = "user" if m["role"] == "user" else "model"
         summary_contents.append(
-            types.Content(role=role, parts=[types.Part.from_text(m["content"])])
+            types.Content(role=role, parts=[types.Part(text=m["content"])])
         )
 
     summary_instruction = (
@@ -510,7 +510,7 @@ def maybe_update_summary(
         summary_resp = client.models.generate_content(
             model="gemini-2.5-flash",  # fast/cheap rail for summaries
             contents=summary_contents + [
-                types.Content(role="user", parts=[types.Part.from_text(summary_instruction)])
+                types.Content(role="user", parts=[types.Part(text=summary_instruction)])
             ],
             config=types.GenerateContentConfig(system_instruction="Summarize the conversation succinctly.")
         )
@@ -520,6 +520,7 @@ def maybe_update_summary(
     except Exception:
         # If summarization fails, continue without pruning
         pass
+
 
 def build_history_contents(max_turns: int = 12):
     """
@@ -534,9 +535,7 @@ def build_history_contents(max_turns: int = 12):
         contents.append(
             types.Content(
                 role="user",
-                parts=[types.Part.from_text(
-                    f"Conversation summary so far (for context, do not repeat verbatim): {st.session_state['summary']}"
-                )]
+                parts=[types.Part(text=f"Conversation summary so far (for context, do not repeat verbatim): {st.session_state['summary']}")]
             )
         )
 
@@ -545,7 +544,7 @@ def build_history_contents(max_turns: int = 12):
         contents.append(
             types.Content(
                 role=role,
-                parts=[types.Part.from_text(m["content"])]
+                parts=[types.Part(text=m["content"])]
             )
         )
     return contents
