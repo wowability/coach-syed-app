@@ -119,30 +119,371 @@ Under all circumstances and always you have to strictly comply with the followin
 - Do NOT mention retrieval or that documents were consulted.
 """
 
-# --- 4. THE AUTO-ROUTER LOGIC (NEW SDK) ---
-def get_optimal_model(user_prompt):
-    """Silently determines if the prompt needs Flash (simple) or Pro (complex)."""
-    router_instruction = """
-    You are a routing assistant. Read the user's prompt.
-    If it is a simple greeting, basic definition, or short question, reply ONLY with the word: FLASH.
-    If it is a complex business scenario, requires applying frameworks, or asks for strategic analysis, reply ONLY with the word: PRO.
+# --- 4. THE AUTO-ROUTER LOGIC ---
+# =========================
+# Router + A/B Testing v1.2
+# Single-file version for app.py
+# =========================
+
+from __future__ import annotations
+import csv
+import hashlib
+import os
+import random
+import re
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+# -----------------------------
+# 0) A/B TEST CONFIG (tuneable)
+# -----------------------------
+AB_TEST = {
+    "enabled": True,            # Turn A/B on/off globally
+    "name": "router_ab_v1",
+    "population_pct": 20,       # % of total traffic eligible for the experiment
+    "treatment_pct": 50,        # % of eligible traffic assigned to the treatment
+    "only_on_borderline": True  # If True, run experiment only for borderline prompts
+}
+
+# How we define "borderline": within this many points of the complex threshold
+BORDERLINE_MARGIN = 0.75
+
+# -----------------------------
+# 1) MODEL MAP
+# -----------------------------
+MODEL_MAP = {
+    "SIMPLE": "gemini-2.5-flash",
+    "COMPLEX": "gemini-2.5-pro",
+}
+
+# -----------------------------
+# 2) BASELINE POLICY (production)
+# -----------------------------
+BASELINE_POLICY = {
+    # thresholds
+    "LEN_CHAR_COMPLEX": 400,
+    "LEN_WORD_COMPLEX": 80,
+    "NUM_QUESTIONS_HIGH": 1,
+    "NUM_BULLETS_COMPLEX": 2,
+    "NUM_LINKS_COMPLEX": 1,
+
+    # weights
+    "WEIGHTS": {
+        "len_char": 2.0,
+        "len_word": 2.0,
+        "questions": 1.5,
+        "bullets": 1.0,
+        "links": 1.0,
+        "complex_kw": 3.0,
+        "simple_kw": -2.0,
+    },
+
+    # decisioning
+    "THRESHOLD_COMPLEX": 3.0,   # score >= this suggests PRO
+    "MARGIN_ESCALATE": 0.5      # within this margin, escalate to PRO
+}
+
+# -----------------------------
+# 3) TREATMENT POLICY (experiment)
+#    Goal: test a slightly more aggressive Flash bias on borderline cases
+# -----------------------------
+TREATMENT_POLICY = {
+    **BASELINE_POLICY,
+    # Use a slightly higher threshold (needs more signals to go PRO)
+    "THRESHOLD_COMPLEX": BASELINE_POLICY["THRESHOLD_COMPLEX"] + 0.4,
+    # Reduce the escalate margin a bit to favor Flash more when unsure
+    "MARGIN_ESCALATE": max(0.2, BASELINE_POLICY["MARGIN_ESCALATE"] - 0.2),
+}
+
+# -----------------------------
+# 4) KEYWORDS
+# -----------------------------
+COMPLEX_KEYWORDS = {
+    "analyze", "analyse", "evaluate", "assess", "diagnose", "critique", "synthesize",
+    "optimize", "prioritize", "tradeoff", "trade-offs", "recommend",
+    "justify", "roadmap", "blueprint", "design a strategy", "build a strategy",
+    "go-to-market", "gtm", "unit economics", "pricing strategy",
+    "vrio", "porter", "five forces", "5 forces", "swot", "pestel", "rbv",
+    "balanced scorecard", "okrs", "csr", "esg", "bcg matrix", "value chain",
+    "financial model", "valuation", "discounted cash flow", "dcf",
+    "marginal cost", "contribution margin", "ltv", "cac", "cohort", "retention",
+    "scenario", "sensitivity", "monte carlo",
+    "case", "caselet", "memo", "brief", "recommendation", "executive summary",
+    "peer-reviewed", "citations", "literature review",
+}
+
+SIMPLE_KEYWORDS = {
+    "hi", "hello", "hey", "thanks", "thank you", "what is", "define", "meaning of",
+    "who are you", "help", "how to use", "usage", "commands", "menu",
+}
+
+PRO_OVERRIDE_KEYWORDS = {"deep coaching", "deep-coaching", "premium analysis", "long-form analysis"}
+
+# -----------------------------
+# 5) LOGGING (CSV for quick analysis)
+# -----------------------------
+EVENTS_CSV = os.environ.get("ROUTER_EVENTS_CSV", "router_events.csv")
+
+def log_event(event: str, props: Dict):
+    """Append a single line JSON-ish row to CSV for quick inspection."""
+    # Create file with header if missing
+    file_exists = os.path.isfile(EVENTS_CSV)
+    with open(EVENTS_CSV, mode="a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["ts", "event", *sorted(props.keys())])
+        if not file_exists:
+            writer.writeheader()
+        row = {"ts": int(time.time()), "event": event}
+        row.update(props)
+        writer.writerow(row)
+
+# -----------------------------
+# 6) HELPERS
+# -----------------------------
+@dataclass
+class RouteDecision:
+    model: str
+    complexity_score: float
+    reason: str
+    policy: str            # "baseline" or "treatment"
+    ab_group: str          # "control" | "treatment" | "none"
+    borderline: bool
+
+def _count_words(s: str) -> int:
+    return len(re.findall(r"\b\w+\b", s))
+
+def _count_bullets(s: str) -> int:
+    bullets = re.findall(r"(?m)^\s*(?:[-*•]+|\d+\)|\d+\.)\s+", s)
+    return len(bullets)
+
+def _count_links(s: str) -> int:
+    return len(re.findall(r"https?://|www\.", s, flags=re.I))
+
+def _has_any(s: str, terms: set[str]) -> bool:
+    s_low = s.lower()
+    return any(t in s_low for t in terms)
+
+def _keyword_hits(s: str, terms: set[str]) -> int:
+    s_low = s.lower()
+    return sum(1 for t in terms if t in s_low)
+
+def _score_complexity(user_prompt: str, policy: Dict) -> Tuple[float, str]:
+    text = user_prompt.strip()
+    reason_bits = []
+    W = policy["WEIGHTS"]
+
+    chars = len(text)
+    words = _count_words(text)
+
+    if chars >= policy["LEN_CHAR_COMPLEX"]:
+        reason_bits.append(f"len_char≥{policy['LEN_CHAR_COMPLEX']} ({chars}) → +{W['len_char']}")
+    if words >= policy["LEN_WORD_COMPLEX"]:
+        reason_bits.append(f"len_word≥{policy['LEN_WORD_COMPLEX']} ({words}) → +{W['len_word']}")
+
+    q_marks = text.count("?")
+    if q_marks > policy["NUM_QUESTIONS_HIGH"]:
+        reason_bits.append(f"questions>{policy['NUM_QUESTIONS_HIGH']} ({q_marks}) → +{W['questions']}")
+
+    bullets = _count_bullets(text)
+    if bullets > policy["NUM_BULLETS_COMPLEX"]:
+        reason_bits.append(f"bullets>{policy['NUM_BULLETS_COMPLEX']} ({bullets}) → +{W['bullets']}")
+
+    links = _count_links(text)
+    if links > policy["NUM_LINKS_COMPLEX"]:
+        reason_bits.append(f"links>{policy['NUM_LINKS_COMPLEX']} ({links}) → +{W['links']}")
+
+    complex_hits = _keyword_hits(text, COMPLEX_KEYWORDS)
+    if complex_hits:
+        add = W["complex_kw"] * min(complex_hits, 2)
+        reason_bits.append(f"complex_kw hits={complex_hits} → +{add}")
+
+    simple_hits = _keyword_hits(text, SIMPLE_KEYWORDS)
+    if simple_hits and chars < policy["LEN_CHAR_COMPLEX"] and words < policy["LEN_WORD_COMPLEX"] and complex_hits == 0:
+        reason_bits.append(f"simple_kw hits={simple_hits} (short) → {W['simple_kw']:+}")
+
+    score = 0.0
+    for bit in reason_bits:
+        m = re.search(r"([+-]\d+(?:\.\d+)?)$", bit)
+        if m:
+            score += float(m.group(1))
+
+    # Combo bonus: multiple signals together
+    if sum(k in " ".join(reason_bits) for k in ["len_", "complex_kw", "questions", "bullets"]) >= 2:
+        score += 0.5
+        reason_bits.append("combo_signals → +0.5")
+
+    return score, "; ".join(reason_bits) if reason_bits else "no strong signals"
+
+def _is_borderline(score: float, policy: Dict) -> bool:
+    th = policy["THRESHOLD_COMPLEX"]
+    return abs(score - th) <= BORDERLINE_MARGIN
+
+# -----------------------------
+# 7) A/B assignment (deterministic if user_key provided)
+# -----------------------------
+def _assign_ab_group(user_key: Optional[str]) -> str:
+    """
+    Returns: "control" | "treatment" | "none"
+    - If AB_TEST is disabled → "none"
+    - If no user_key, uses a per-process random fallback (non-persistent across restarts)
+    - Deterministic hashing of user_key → stable bucket 0..99
+    """
+    if not AB_TEST.get("enabled", False):
+        return "none"
+
+    # population gating
+    if user_key:
+        h = hashlib.sha256((AB_TEST["name"] + ":" + user_key).encode("utf-8")).hexdigest()
+        bucket = int(h[:8], 16) % 100
+    else:
+        # best-effort fallback without persistence
+        bucket = random.randint(0, 99)
+
+    if bucket >= AB_TEST["population_pct"]:
+        return "none"  # out of experiment population
+
+    # within population: assign to treatment %
+    return "treatment" if (bucket % 100) < AB_TEST["treatment_pct"] else "control"
+
+# -----------------------------
+# 8) Main router
+# -----------------------------
+def choose_model(
+    user_prompt: str,
+    *,
+    user_key: Optional[str] = None,     # e.g., email, user_id; pass for stable A/B
+    force_model: Optional[str] = None,
+    return_reason: bool = False
+) -> str | RouteDecision:
+    """
+    Pure-Python router with A/B testing.
+    - Never calls an LLM.
+    - If 'force_model' provided → honor it.
+    - If prompt has 'deep coaching' keywords → force PRO.
+    - Else score complexity under either BASELINE or TREATMENT policy (via A/B assignment).
+    - For borderline prompts and AB_TEST.only_on_borderline=True, run A/B; otherwise use baseline.
+
+    Returns model string or RouteDecision.
     """
     try:
-        # Using gemini-2.5-flash for the quick check
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=user_prompt,
-            config=types.GenerateContentConfig(system_instruction=router_instruction)
-        )
-        decision = response.text.strip().upper()
-        
-        if "PRO" in decision:
-            return "gemini-2.5-pro"
-        else:
-            return "gemini-2.5-flash"
-    except:
-        return "gemini-2.5-pro" # Default to the smart model if routing fails
+        text = (user_prompt or "").strip()
+        if not text:
+            model = MODEL_MAP["SIMPLE"]
+            decision = RouteDecision(
+                model=model, complexity_score=0.0, reason="empty prompt → SIMPLE",
+                policy="baseline", ab_group="none", borderline=False
+            )
+            _log_decision(decision, user_key)
+            return decision if return_reason else model
 
+        # Explicit overrides
+        if force_model:
+            fm = force_model.strip().lower()
+            if fm in {"pro", "gemini-2.5-pro"}:
+                decision = RouteDecision(
+                    model=MODEL_MAP["COMPLEX"], complexity_score=999.0, reason="force_model=pro",
+                    policy="baseline", ab_group="none", borderline=False
+                )
+                _log_decision(decision, user_key)
+                return decision if return_reason else decision.model
+            if fm in {"flash", "gemini-2.5-flash"}:
+                decision = RouteDecision(
+                    model=MODEL_MAP["SIMPLE"], complexity_score=-999.0, reason="force_model=flash",
+                    policy="baseline", ab_group="none", borderline=False
+                )
+                _log_decision(decision, user_key)
+                return decision if return_reason else decision.model
+
+        # Deep Coaching override
+        if _has_any(text, PRO_OVERRIDE_KEYWORDS):
+            decision = RouteDecision(
+                model=MODEL_MAP["COMPLEX"], complexity_score=999.0, reason="override keyword → PRO",
+                policy="baseline", ab_group="none", borderline=False
+            )
+            _log_decision(decision, user_key)
+            return decision if return_reason else decision.model
+
+        # First, compute baseline score to see if it's borderline
+        base_score, base_reason = _score_complexity(text, BASELINE_POLICY)
+        borderline = _is_borderline(base_score, BASELINE_POLICY)
+
+        # Determine AB group
+        ab_group = _assign_ab_group(user_key)
+        in_experiment = (ab_group != "none")
+
+        # Decide whether to apply treatment
+        use_treatment = False
+        if AB_TEST.get("enabled", False) and in_experiment:
+            if AB_TEST.get("only_on_borderline", True):
+                use_treatment = borderline and (ab_group == "treatment")
+            else:
+                use_treatment = (ab_group == "treatment")
+
+        # Apply selected policy
+        policy_name = "treatment" if use_treatment else "baseline"
+        policy = TREATMENT_POLICY if use_treatment else BASELINE_POLICY
+
+        score, reason = (base_score, base_reason) if policy_name == "baseline" else _score_complexity(text, policy)
+
+        # Decision with margin
+        threshold = policy["THRESHOLD_COMPLEX"]
+        margin = policy["MARGIN_ESCALATE"]
+        if score > threshold - margin:
+            model = MODEL_MAP["COMPLEX"]
+            final_reason = f"[{policy_name}] score={score:.2f} ≥ {threshold - margin:.2f} → PRO; {reason}"
+        else:
+            model = MODEL_MAP["SIMPLE"]
+            final_reason = f"[{policy_name}] score={score:.2f} < {threshold - margin:.2f} → FLASH; {reason}"
+
+        decision = RouteDecision(
+            model=model, complexity_score=score, reason=final_reason,
+            policy=policy_name, ab_group=ab_group, borderline=borderline
+        )
+        _log_decision(decision, user_key)
+        return decision if return_reason else model
+
+    except Exception as e:
+        # Fail safe to PRO
+        decision = RouteDecision(
+            model=MODEL_MAP["COMPLEX"], complexity_score=0.0,
+            reason=f"router_exception: {e!r} → default PRO",
+            policy="baseline", ab_group="none", borderline=False
+        )
+        _log_decision(decision, user_key)
+        return decision if return_reason else decision.model
+
+def _log_decision(decision: RouteDecision, user_key: Optional[str]):
+    try:
+        log_event("router_decision", {
+            "model": decision.model,
+            "score": f"{decision.complexity_score:.2f}",
+            "reason": decision.reason,
+            "policy": decision.policy,
+            "ab_group": decision.ab_group,
+            "borderline": str(decision.borderline),
+            "user_key_hash": hashlib.sha256((user_key or "anon").encode("utf-8")).hexdigest()[:10],
+        })
+    except Exception:
+        # Non-fatal; don't block routing on logging
+        pass
+
+# -----------------------------
+# 9) USAGE EXAMPLE (replace with your chat handler)
+# -----------------------------
+if __name__ == "__main__":
+    # Example: simulate two users, same prompt
+    prompts = [
+        "Hi there!",
+        "Analyze Tesla’s competitive advantage using VRIO and Porter’s Five Forces. Provide an executive summary and a recommendation.",
+        "Can you define SWOT?",
+        "Outline a pricing strategy and go-to-market roadmap for a new B2B SaaS in the HR tech space. Include unit economics (LTV/CAC)."
+    ]
+
+    for i, p in enumerate(prompts, start=1):
+        decision = choose_model(p, user_key=f"user{i}@example.edu", return_reason=True)
+        print(f"\nPROMPT {i}: {p}\n→ MODEL: {decision.model}\n→ SCORE: {decision.complexity_score:.2f}\n→ REASON: {decision.reason}\n→ AB: {decision.ab_group} | policy={decision.policy} | borderline={decision.borderline}")
+
+  
 # --- 5. CHAT HISTORY LOGIC ---
 if "messages" not in st.session_state:
     st.session_state.messages = []
