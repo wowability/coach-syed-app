@@ -120,12 +120,12 @@ Under all circumstances and always you have to strictly comply with the followin
 """
 
 # --- 4. THE AUTO-ROUTER LOGIC ---
+
 # =========================
-# Router + A/B Testing v1.2
-# Single-file version for app.py
+# Router + A/B Testing (Py38+ safe)
+# Single-file block for app.py
 # =========================
 
-from __future__ import annotations
 import csv
 import hashlib
 import os
@@ -133,7 +133,7 @@ import random
 import re
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, Set, Union
 
 # -----------------------------
 # 0) A/B TEST CONFIG (tuneable)
@@ -143,7 +143,7 @@ AB_TEST = {
     "name": "router_ab_v1",
     "population_pct": 20,       # % of total traffic eligible for the experiment
     "treatment_pct": 50,        # % of eligible traffic assigned to the treatment
-    "only_on_borderline": True  # If True, run experiment only for borderline prompts
+    "only_on_borderline": True  # If True, experiment only for borderline prompts
 }
 
 # How we define "borderline": within this many points of the complex threshold
@@ -186,20 +186,18 @@ BASELINE_POLICY = {
 
 # -----------------------------
 # 3) TREATMENT POLICY (experiment)
-#    Goal: test a slightly more aggressive Flash bias on borderline cases
+#    Goal: bias slightly more to Flash on borderline cases
 # -----------------------------
 TREATMENT_POLICY = {
     **BASELINE_POLICY,
-    # Use a slightly higher threshold (needs more signals to go PRO)
     "THRESHOLD_COMPLEX": BASELINE_POLICY["THRESHOLD_COMPLEX"] + 0.4,
-    # Reduce the escalate margin a bit to favor Flash more when unsure
     "MARGIN_ESCALATE": max(0.2, BASELINE_POLICY["MARGIN_ESCALATE"] - 0.2),
 }
 
 # -----------------------------
 # 4) KEYWORDS
 # -----------------------------
-COMPLEX_KEYWORDS = {
+COMPLEX_KEYWORDS: Set[str] = {
     "analyze", "analyse", "evaluate", "assess", "diagnose", "critique", "synthesize",
     "optimize", "prioritize", "tradeoff", "trade-offs", "recommend",
     "justify", "roadmap", "blueprint", "design a strategy", "build a strategy",
@@ -212,13 +210,11 @@ COMPLEX_KEYWORDS = {
     "case", "caselet", "memo", "brief", "recommendation", "executive summary",
     "peer-reviewed", "citations", "literature review",
 }
-
-SIMPLE_KEYWORDS = {
+SIMPLE_KEYWORDS: Set[str] = {
     "hi", "hello", "hey", "thanks", "thank you", "what is", "define", "meaning of",
     "who are you", "help", "how to use", "usage", "commands", "menu",
 }
-
-PRO_OVERRIDE_KEYWORDS = {"deep coaching", "deep-coaching", "premium analysis", "long-form analysis"}
+PRO_OVERRIDE_KEYWORDS: Set[str] = {"deep coaching", "deep-coaching", "premium analysis", "long-form analysis"}
 
 # -----------------------------
 # 5) LOGGING (CSV for quick analysis)
@@ -226,8 +222,7 @@ PRO_OVERRIDE_KEYWORDS = {"deep coaching", "deep-coaching", "premium analysis", "
 EVENTS_CSV = os.environ.get("ROUTER_EVENTS_CSV", "router_events.csv")
 
 def log_event(event: str, props: Dict):
-    """Append a single line JSON-ish row to CSV for quick inspection."""
-    # Create file with header if missing
+    """Append a single CSV row with key decision details."""
     file_exists = os.path.isfile(EVENTS_CSV)
     with open(EVENTS_CSV, mode="a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=["ts", "event", *sorted(props.keys())])
@@ -259,11 +254,11 @@ def _count_bullets(s: str) -> int:
 def _count_links(s: str) -> int:
     return len(re.findall(r"https?://|www\.", s, flags=re.I))
 
-def _has_any(s: str, terms: set[str]) -> bool:
+def _has_any(s: str, terms: Set[str]) -> bool:
     s_low = s.lower()
     return any(t in s_low for t in terms)
 
-def _keyword_hits(s: str, terms: set[str]) -> int:
+def _keyword_hits(s: str, terms: Set[str]) -> int:
     s_low = s.lower()
     return sum(1 for t in terms if t in s_low)
 
@@ -294,7 +289,7 @@ def _score_complexity(user_prompt: str, policy: Dict) -> Tuple[float, str]:
 
     complex_hits = _keyword_hits(text, COMPLEX_KEYWORDS)
     if complex_hits:
-        add = W["complex_kw"] * min(complex_hits, 2)
+        add = W["complex_kw"] * min(complex_hits, 2)  # cap at 2 for stability
         reason_bits.append(f"complex_kw hits={complex_hits} → +{add}")
 
     simple_hits = _keyword_hits(text, SIMPLE_KEYWORDS)
@@ -325,24 +320,21 @@ def _assign_ab_group(user_key: Optional[str]) -> str:
     """
     Returns: "control" | "treatment" | "none"
     - If AB_TEST is disabled → "none"
-    - If no user_key, uses a per-process random fallback (non-persistent across restarts)
-    - Deterministic hashing of user_key → stable bucket 0..99
+    - If user_key is provided, use deterministic hashing for stable assignment
+    - Else, use a random fallback (non-persistent across restarts)
     """
     if not AB_TEST.get("enabled", False):
         return "none"
 
-    # population gating
     if user_key:
         h = hashlib.sha256((AB_TEST["name"] + ":" + user_key).encode("utf-8")).hexdigest()
         bucket = int(h[:8], 16) % 100
     else:
-        # best-effort fallback without persistence
         bucket = random.randint(0, 99)
 
     if bucket >= AB_TEST["population_pct"]:
-        return "none"  # out of experiment population
+        return "none"
 
-    # within population: assign to treatment %
     return "treatment" if (bucket % 100) < AB_TEST["treatment_pct"] else "control"
 
 # -----------------------------
@@ -351,17 +343,17 @@ def _assign_ab_group(user_key: Optional[str]) -> str:
 def choose_model(
     user_prompt: str,
     *,
-    user_key: Optional[str] = None,     # e.g., email, user_id; pass for stable A/B
+    user_key: Optional[str] = None,     # e.g., email or user_id for stable A/B
     force_model: Optional[str] = None,
     return_reason: bool = False
-) -> str | RouteDecision:
+) -> Union[str, RouteDecision]:
     """
     Pure-Python router with A/B testing.
-    - Never calls an LLM.
-    - If 'force_model' provided → honor it.
-    - If prompt has 'deep coaching' keywords → force PRO.
-    - Else score complexity under either BASELINE or TREATMENT policy (via A/B assignment).
-    - For borderline prompts and AB_TEST.only_on_borderline=True, run A/B; otherwise use baseline.
+    - No LLM call for routing.
+    - 'force_model' honored.
+    - 'deep coaching' keywords force PRO.
+    - Scores complexity using either BASELINE or TREATMENT policy (A/B).
+    - If AB_TEST.only_on_borderline=True, experiment only runs for borderline prompts.
 
     Returns model string or RouteDecision.
     """
@@ -403,11 +395,11 @@ def choose_model(
             _log_decision(decision, user_key)
             return decision if return_reason else decision.model
 
-        # First, compute baseline score to see if it's borderline
+        # First compute baseline score to check borderline
         base_score, base_reason = _score_complexity(text, BASELINE_POLICY)
         borderline = _is_borderline(base_score, BASELINE_POLICY)
 
-        # Determine AB group
+        # Assign A/B
         ab_group = _assign_ab_group(user_key)
         in_experiment = (ab_group != "none")
 
@@ -419,10 +411,9 @@ def choose_model(
             else:
                 use_treatment = (ab_group == "treatment")
 
-        # Apply selected policy
+        # Score with selected policy
         policy_name = "treatment" if use_treatment else "baseline"
         policy = TREATMENT_POLICY if use_treatment else BASELINE_POLICY
-
         score, reason = (base_score, base_reason) if policy_name == "baseline" else _score_complexity(text, policy)
 
         # Decision with margin
@@ -464,24 +455,8 @@ def _log_decision(decision: RouteDecision, user_key: Optional[str]):
             "user_key_hash": hashlib.sha256((user_key or "anon").encode("utf-8")).hexdigest()[:10],
         })
     except Exception:
-        # Non-fatal; don't block routing on logging
+        # Non-fatal; ignore logging errors
         pass
-
-# -----------------------------
-# 9) USAGE EXAMPLE (replace with your chat handler)
-# -----------------------------
-if __name__ == "__main__":
-    # Example: simulate two users, same prompt
-    prompts = [
-        "Hi there!",
-        "Analyze Tesla’s competitive advantage using VRIO and Porter’s Five Forces. Provide an executive summary and a recommendation.",
-        "Can you define SWOT?",
-        "Outline a pricing strategy and go-to-market roadmap for a new B2B SaaS in the HR tech space. Include unit economics (LTV/CAC)."
-    ]
-
-    for i, p in enumerate(prompts, start=1):
-        decision = choose_model(p, user_key=f"user{i}@example.edu", return_reason=True)
-        print(f"\nPROMPT {i}: {p}\n→ MODEL: {decision.model}\n→ SCORE: {decision.complexity_score:.2f}\n→ REASON: {decision.reason}\n→ AB: {decision.ab_group} | policy={decision.policy} | borderline={decision.borderline}")
 
   
 # --- 5. CHAT HISTORY LOGIC ---
